@@ -116,6 +116,7 @@
 #define REDIS_SET 2
 #define REDIS_ZSET 3
 #define REDIS_HASH 4
+#define REDIS_ZHASH 5
 
 /* Objects encoding */
 #define REDIS_ENCODING_RAW 0    /* Raw representation */
@@ -468,6 +469,12 @@ typedef struct zset {
     zskiplist *zsl;
 } zset;
 
+/* used as value of a the zhash dict */
+typedef struct zhashvalue {
+    double score;
+    robj *payload;
+} zhashvalue;
+
 /* Our shared "common" objects */
 
 struct sharedObjectsStruct {
@@ -640,6 +647,7 @@ static void zcardCommand(redisClient *c);
 static void zremCommand(redisClient *c);
 static void zscoreCommand(redisClient *c);
 static void zremrangebyscoreCommand(redisClient *c);
+static void zhaddCommand(redisClient *c);
 static void multiCommand(redisClient *c);
 static void execCommand(redisClient *c);
 static void blpopCommand(redisClient *c);
@@ -694,6 +702,7 @@ static struct redisCommand cmdTable[] = {
     {"zrevrange",zrevrangeCommand,-4,REDIS_CMD_INLINE},
     {"zcard",zcardCommand,2,REDIS_CMD_INLINE},
     {"zscore",zscoreCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
+    {"zhadd",zhaddCommand,5,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
     {"incrby",incrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"decrby",decrbyCommand,3,REDIS_CMD_INLINE|REDIS_CMD_DENYOOM},
     {"getset",getsetCommand,3,REDIS_CMD_BULK|REDIS_CMD_DENYOOM},
@@ -899,6 +908,13 @@ static void dictListDestructor(void *privdata, void *val)
     listRelease((list*)val);
 }
 
+static void dictZhashValueFree(void *privdata, void *val)
+{
+    DICT_NOTUSED(privdata);
+    decrRefCount(((zhashvalue*) val)->payload);
+    zfree(val);
+}
+
 static int sdsDictKeyCompare(void *privdata, const void *key1,
         const void *key2)
 {
@@ -972,6 +988,16 @@ static dictType zsetDictType = {
     dictEncObjKeyCompare,      /* key compare */
     dictRedisObjectDestructor, /* key destructor */
     dictVanillaFree            /* val destructor of malloc(sizeof(double)) */
+};
+
+/* Sorted hashes hash (still with skiplist) */
+static dictType zhashDictType = {
+    dictEncObjHash,            /* hash function */
+    NULL,                      /* key dup */
+    NULL,                      /* val dup */
+    dictEncObjKeyCompare,      /* key compare */
+    dictRedisObjectDestructor, /* key destructor */
+    dictZhashValueFree         /* val destructor */
 };
 
 /* Db->dict */
@@ -2464,6 +2490,14 @@ static robj *createZsetObject(void) {
     return createObject(REDIS_ZSET,zs);
 }
 
+static robj *createZhashObject(void) {
+    zset *zs = zmalloc(sizeof(*zs));
+
+    zs->dict = dictCreate(&zhashDictType,NULL);
+    zs->zsl = zslCreate();
+    return createObject(REDIS_ZHASH,zs);
+}
+
 static void freeStringObject(robj *o) {
     if (o->encoding == REDIS_ENCODING_RAW) {
         sdsfree(o->ptr);
@@ -2527,6 +2561,7 @@ static void decrRefCount(void *obj) {
         case REDIS_SET: freeSetObject(o); break;
         case REDIS_ZSET: freeZsetObject(o); break;
         case REDIS_HASH: freeHashObject(o); break;
+        case REDIS_ZHASH: freeZsetObject(o); break;
         default: redisAssert(0 != 0); break;
         }
         if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
@@ -2974,6 +3009,22 @@ static int rdbSaveObject(FILE *fp, robj *o) {
             if (rdbSaveDoubleValue(fp,*score) == -1) return -1;
         }
         dictReleaseIterator(di);
+    } else if (o->type == REDIS_ZHASH) {
+        /* Save a ZHash value */
+        zset *zs = o->ptr;
+        dictIterator *di = dictGetIterator(zs->dict);
+        dictEntry *de;
+
+        if (rdbSaveLen(fp,dictSize(zs->dict)) == -1) return -1;
+        while((de = dictNext(di)) != NULL) {
+            robj *eleobj = dictGetEntryKey(de);
+            zhashvalue *zhv = dictGetEntryVal(de);
+
+            if (rdbSaveStringObject(fp,eleobj) == -1) return -1;
+            if (rdbSaveDoubleValue(fp,zhv->score) == -1) return -1;
+            if (rdbSaveStringObject(fp,zhv->payload) == -1) return -1;
+        }
+        dictReleaseIterator(di);
     } else {
         redisAssert(0 != 0);
     }
@@ -3310,6 +3361,31 @@ static robj *rdbLoadObject(int type, FILE *fp) {
             if (rdbLoadDoubleValue(fp,score) == -1) return NULL;
             dictAdd(zs->dict,ele,score);
             zslInsert(zs->zsl,*score,ele);
+            incrRefCount(ele); /* added to skiplist */
+        }
+    } else if (type == REDIS_ZHASH) {
+        /* Read list/set value */
+        uint32_t zhashlen;
+        zset *zh;
+
+        if ((zhashlen = rdbLoadLen(fp,NULL)) == REDIS_RDB_LENERR) return NULL;
+        o = createZhashObject();
+        zh = o->ptr;
+        /* Load every single element of the zhash */
+        while(zhashlen--) {
+            robj *ele;
+            zhashvalue *value = zmalloc(sizeof(zhashvalue));
+
+            if ((ele = rdbLoadStringObject(fp)) == NULL) return NULL;
+            tryObjectEncoding(ele);
+
+            if (rdbLoadDoubleValue(fp,&(value->score)) == -1) return NULL;
+
+            if ((value->payload = rdbLoadStringObject(fp)) == NULL) return NULL;
+            tryObjectEncoding(value->payload);
+
+            dictAdd(zh->dict,ele,value);
+            zslInsert(zh->zsl,value->score,ele);
             incrRefCount(ele); /* added to skiplist */
         }
     } else {
@@ -4843,35 +4919,55 @@ static zskiplistNode *zslFirstWithScore(zskiplist *zsl, double score) {
 /* This generic command implements both ZADD and ZINCRBY.
  * scoreval is the score if the operation is a ZADD (doincrement == 0) or
  * the increment if the operation is a ZINCRBY (doincrement == 1). */
-static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scoreval, int doincrement) {
+static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, robj* payload, double scoreval, int doincrement) {
     robj *zsetobj;
     zset *zs;
+    void *dictValue;
     double *score;
 
     zsetobj = lookupKeyWrite(c->db,key);
     if (zsetobj == NULL) {
-        zsetobj = createZsetObject();
+        if(payload == NULL) {
+            zsetobj = createZsetObject();
+        } else {
+            zsetobj = createZhashObject();
+        }
         dictAdd(c->db->dict,key,zsetobj);
         incrRefCount(key);
     } else {
-        if (zsetobj->type != REDIS_ZSET) {
+        if (   !(zsetobj->type == REDIS_ZSET && payload == NULL)
+            && !(zsetobj->type == REDIS_ZHASH && payload != NULL) ) {
             addReply(c,shared.wrongtypeerr);
             return;
         }
     }
     zs = zsetobj->ptr;
 
+    if(zsetobj->type == REDIS_ZSET) {
+        dictValue = score = zmalloc(sizeof(double));
+    } else {
+        zhashvalue* zhv = (zhashvalue*) zmalloc(sizeof(zhashvalue));
+        incrRefCount(payload);
+        zhv->payload = payload;
+        score = &(zhv->score);
+        dictValue = zhv;
+    }
+
     /* Ok now since we implement both ZADD and ZINCRBY here the code
      * needs to handle the two different conditions. It's all about setting
      * '*score', that is, the new score to set, to the right value. */
-    score = zmalloc(sizeof(double));
     if (doincrement) {
         dictEntry *de;
 
         /* Read the old score. If the element was not present starts from 0 */
         de = dictFind(zs->dict,ele);
         if (de) {
-            double *oldscore = dictGetEntryVal(de);
+            double *oldscore;
+            if (zsetobj->type == REDIS_ZSET) {
+                oldscore = dictGetEntryVal(de);
+            } else {
+                oldscore = &(((zhashvalue*)dictGetEntryVal(de))->score);
+            }
             *score = *oldscore + scoreval;
         } else {
             *score = scoreval;
@@ -4882,24 +4978,25 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
 
     /* What follows is a simple remove and re-insert operation that is common
      * to both ZADD and ZINCRBY... */
-    if (dictAdd(zs->dict,ele,score) == DICT_OK) {
+    if (dictAdd(zs->dict,ele,dictValue) == DICT_OK) {
         /* case 1: New element */
         incrRefCount(ele); /* added to hash */
         zslInsert(zs->zsl,*score,ele);
         incrRefCount(ele); /* added to skiplist */
         server.dirty++;
-        if (doincrement)
-            addReplyDouble(c,*score);
-        else
-            addReply(c,shared.cone);
     } else {
         dictEntry *de;
-        double *oldscore;
-        
-        /* case 2: Score update operation */
+        /* case 2: Update operation */
         de = dictFind(zs->dict,ele);
         redisAssert(de != NULL);
-        oldscore = dictGetEntryVal(de);
+        double * oldscore;
+        if(zsetobj->type == REDIS_ZSET) {
+            oldscore = dictGetEntryVal(de);
+        } else {
+            oldscore = &(((zhashvalue*)dictGetEntryVal(de))->score);
+        }
+
+        /* update skip list if necessary */
         if (*score != *oldscore) {
             int deleted;
 
@@ -4907,32 +5004,42 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
             deleted = zslDelete(zs->zsl,*oldscore,ele);
             redisAssert(deleted != 0);
             zslInsert(zs->zsl,*score,ele);
+        }
+
+        /* update dict */
+        if (*score != *oldscore || zsetobj->type == REDIS_ZHASH) {
+            dictReplace(zs->dict,ele,dictValue);
             incrRefCount(ele);
-            /* Update the score in the hash table */
-            dictReplace(zs->dict,ele,score);
             server.dirty++;
         } else {
             zfree(score);
         }
-        if (doincrement)
-            addReplyDouble(c,*score);
-        else
-            addReply(c,shared.czero);
     }
+    if (doincrement)
+        addReplyDouble(c,*score);
+    else
+        addReply(c,shared.czero);
 }
 
 static void zaddCommand(redisClient *c) {
     double scoreval;
 
     scoreval = strtod(c->argv[2]->ptr,NULL);
-    zaddGenericCommand(c,c->argv[1],c->argv[3],scoreval,0);
+    zaddGenericCommand(c,c->argv[1],c->argv[3],NULL,scoreval,0);
+}
+
+static void zhaddCommand(redisClient *c) {
+    double scoreval;
+
+    scoreval = strtod(c->argv[2]->ptr,NULL);
+    zaddGenericCommand(c,c->argv[1],c->argv[3],c->argv[4],scoreval,0);
 }
 
 static void zincrbyCommand(redisClient *c) {
     double scoreval;
 
     scoreval = strtod(c->argv[2]->ptr,NULL);
-    zaddGenericCommand(c,c->argv[1],c->argv[3],scoreval,1);
+    zaddGenericCommand(c,c->argv[1],c->argv[3],NULL,scoreval,1);
 }
 
 static void zremCommand(redisClient *c) {
@@ -4996,13 +5103,22 @@ static void zremrangebyscoreCommand(redisClient *c) {
 
 static void zrangeGenericCommand(redisClient *c, int reverse) {
     robj *o;
+    int i;
     int start = atoi(c->argv[2]->ptr);
     int end = atoi(c->argv[3]->ptr);
     int withscores = 0;
+    int withpayload = 0;
 
-    if (c->argc == 5 && !strcasecmp(c->argv[4]->ptr,"withscores")) {
+    if (c->argc > 6) {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+    for(i = 4; i < c->argc ; i++)
+    if (!strcasecmp(c->argv[i]->ptr,"withscores")) {
         withscores = 1;
-    } else if (c->argc >= 5) {
+    } else if(!strcasecmp(c->argv[i]->ptr,"withpayload")) {
+        withpayload = 1;
+    } else {
         addReply(c,shared.syntaxerr);
         return;
     }
@@ -5011,12 +5127,16 @@ static void zrangeGenericCommand(redisClient *c, int reverse) {
     if (o == NULL) {
         addReply(c,shared.nullmultibulk);
     } else {
-        if (o->type != REDIS_ZSET) {
+        if ((o->type != REDIS_ZSET && o->type != REDIS_ZHASH)
+            || (o->type == REDIS_ZSET && withpayload))
+        {
             addReply(c,shared.wrongtypeerr);
         } else {
             zset *zsetobj = o->ptr;
             zskiplist *zsl = zsetobj->zsl;
             zskiplistNode *ln;
+            zhashvalue *zhv;
+            dictEntry *de;
 
             int llen = zsl->length;
             int rangelen, j;
@@ -5049,7 +5169,7 @@ static void zrangeGenericCommand(redisClient *c, int reverse) {
             }
 
             addReplySds(c,sdscatprintf(sdsempty(),"*%d\r\n",
-                withscores ? (rangelen*2) : rangelen));
+                rangelen*(1 + withscores + withpayload) ) );
             for (j = 0; j < rangelen; j++) {
                 ele = ln->obj;
                 addReplyBulkLen(c,ele);
@@ -5057,6 +5177,14 @@ static void zrangeGenericCommand(redisClient *c, int reverse) {
                 addReply(c,shared.crlf);
                 if (withscores)
                     addReplyDouble(c,ln->score);
+                if (withpayload) {
+                    de = dictFind(zsetobj->dict, ele);
+                    redisAssert(de);
+                    zhv = dictGetEntryVal(de);
+                    addReplyBulkLen(c,zhv->payload);
+                    addReply(c,zhv->payload);
+                    addReply(c,shared.crlf);
+                }
                 ln = reverse ? ln->backward : ln->forward[0];
             }
         }

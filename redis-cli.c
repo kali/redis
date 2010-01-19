@@ -103,6 +103,7 @@ static struct redisCommand cmdTable[] = {
     {"zrevrange",-4,REDIS_CMD_INLINE},
     {"zcard",2,REDIS_CMD_INLINE},
     {"zscore",3,REDIS_CMD_BULK},
+    {"zhadd",5,REDIS_CMD_MULTIBULK},
     {"incrby",3,REDIS_CMD_INLINE},
     {"decrby",3,REDIS_CMD_INLINE},
     {"getset",3,REDIS_CMD_BULK},

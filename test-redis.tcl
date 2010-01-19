@@ -887,6 +887,9 @@ proc main {server port} {
         $r zadd mytestzset a 10
         $r zadd mytestzset b 20
         $r zadd mytestzset c 30
+        $r zhadd mytestzhash 10 a va
+        $r zhadd mytestzhash 20 b vb
+        $r zhadd mytestzhash 30 c vc
         $r save
     } {OK}
 
@@ -1383,26 +1386,52 @@ proc main {server port} {
         list [$r zremrangebyscore zset -inf +inf] [$r zrange zset 0 -1]
     } {5 {}}
 
-    test {SORT against sorted sets} {
-        $r del zset
-        $r zadd zset 1 a
-        $r zadd zset 5 b
-        $r zadd zset 2 c
-        $r zadd zset 10 d
-        $r zadd zset 3 e
-        $r sort zset alpha desc
-    } {e d c b a}
+    test {ZHADD basics} {
+        $r zhadd zhtmp 10 x vx
+        $r zhadd zhtmp 20 y vy
+        $r zhadd zhtmp 30 z vz
+        set aux1 [$r zrange zhtmp 0 -1]
+        $r zhadd zhtmp 1 y vy2
+        set aux2 [$r zrange zhtmp 0 -1]
+        list $aux1 $aux2
+    } {{x y z} {y x z}}
+    
+    test {ZHRANGE basics} {
+        $r del zhtmp
+        $r zhadd zhtmp 2 b v_b
+        $r zhadd zhtmp 3 c v_c
+        $r zhadd zhtmp 4 d v_d
+        $r zrange zhtmp 0 -1
+    } {b c d}
+    
+    test {ZHRANGE WITHSCORES} {
+        $r zrange zhtmp 0 -1 withscores
+    } {b 2 c 3 d 4}
+    
+    test {ZHRANGE WITHPAYLOAD} {
+        $r zrange zhtmp 0 -1 withpayload
+    } {b v_b c v_c d v_d}
+    
+    test {ZHRANGE WITHSORES WITHPAYLOAD} {
+        $r zrange zhtmp 0 -1 withscores withpayload
+    } {b 2 v_b c 3 v_c d 4 v_d}
+    
+    test {ZHASH SAVE/LOAD} {
+        $r debug reload
+        $r zrange zhtmp 0 -1 withscores withpayload
+    } {b 2 v_b c 3 v_c d 4 v_d}
 
-    test {Sorted sets +inf and -inf handling} {
-        $r del zset
-        $r zadd zset -100 a
-        $r zadd zset 200 b
-        $r zadd zset -300 c
-        $r zadd zset 1000000 d
-        $r zadd zset +inf max
-        $r zadd zset -inf min
-        $r zrange zset 0 -1
-    } {min c a b d max}
+    
+    test {ZHASH basic ZHADD and score update} {
+        $r del zhtmp
+        $r zhadd zhtmp 10 x vx
+        $r zhadd zhtmp 20 y vy 
+        $r zhadd zhtmp 30 z vz
+        set aux1 [$r zrange zhtmp 0 -1]
+        $r zhadd zhtmp 1 y vy
+        set aux2 [$r zrange zhtmp 0 -1]
+        list $aux1 $aux2
+    } {{x y z} {y x z}}
 
     test {EXPIRE - don't set timeouts multiple times} {
         $r set x foobar
