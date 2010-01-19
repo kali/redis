@@ -5222,7 +5222,7 @@ static void zrangebyscoreCommand(redisClient *c) {
     if (o == NULL) {
         addReply(c,shared.nullmultibulk);
     } else {
-        if (o->type != REDIS_ZSET) {
+        if (o->type != REDIS_ZSET || o->type != REDIS_ZHASH) {
             addReply(c,shared.wrongtypeerr);
         } else {
             zset *zsetobj = o->ptr;
@@ -5276,7 +5276,7 @@ static void zcardCommand(redisClient *c) {
         addReply(c,shared.czero);
         return;
     } else {
-        if (o->type != REDIS_ZSET) {
+        if (o->type != REDIS_ZSET || o->type != REDIS_ZHASH) {
             addReply(c,shared.wrongtypeerr);
         } else {
             zs = o->ptr;
@@ -5294,7 +5294,7 @@ static void zscoreCommand(redisClient *c) {
         addReply(c,shared.nullbulk);
         return;
     } else {
-        if (o->type != REDIS_ZSET) {
+        if (o->type != REDIS_ZSET || o->type != REDIS_ZHASH) {
             addReply(c,shared.wrongtypeerr);
         } else {
             dictEntry *de;
